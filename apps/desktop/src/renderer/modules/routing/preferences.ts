@@ -36,8 +36,21 @@ function readBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
 
+function readNullableString(value: unknown, fallback: string | null): string | null {
+  if (typeof value === 'string' && value.trim().length > 0) return value;
+  if (value === null) return null;
+  return fallback;
+}
+
 function readNonNegativeFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+/** CQT dial: only these five discrete positions are valid. */
+const VALID_CQT_VALUES = new Set([1, 3, 5, 7, 9]);
+
+function readCqt(value: unknown, fallback: number): number {
+  return typeof value === 'number' && VALID_CQT_VALUES.has(value) ? value : fallback;
 }
 
 /** Trimmed, de-duplicated, blank-free peer id list — order preserved. */
@@ -88,6 +101,12 @@ export function loadVprRoutingPreferences(fallback: VprRoutingPreferences): VprR
     minTrustScore = fallback.minTrustScore;
   }
 
+  // Real-money consent: defaults to off on any unrecognized/missing stored
+  // value, never on -- readBoolean's `fallback` here must itself be `false`
+  // (see DEFAULT_MODEL_ROUTING_PREFERENCES), not inherited from some other
+  // truthy default.
+  const autoDayPassEnabled = readBoolean(parsed.autoDayPassEnabled, fallback.autoDayPassEnabled ?? false);
+
   return {
     autoRouting: readBoolean(parsed.autoRouting, fallback.autoRouting),
     preferFreePeers: readBoolean(parsed.preferFreePeers, fallback.preferFreePeers),
@@ -102,6 +121,15 @@ export function loadVprRoutingPreferences(fallback: VprRoutingPreferences): VprR
     blockedPeerIds: Array.isArray(parsed.blockedPeerIds)
       ? normalizePeerIdList(parsed.blockedPeerIds)
       : fallback.blockedPeerIds,
+    cqt: readCqt(parsed.cqt, fallback.cqt ?? 5),
+    autoDayPassEnabled,
+    // Nothing is selected until the user explicitly picks a router, whether
+    // the field is absent or explicitly `null` (VprPreferencesView writes
+    // `null` for the user's "None" choice) -- both resolve the same way.
+    selectedRouterPackage: readNullableString(
+      parsed.selectedRouterPackage,
+      fallback.selectedRouterPackage ?? null,
+    ),
   };
 }
 
@@ -126,6 +154,10 @@ export function buyerModelRoutingPreferences(
     minTrustScore: value.minTrustScore,
     allowedPeerIds: validPeerIds(value.allowedPeerIds),
     blockedPeerIds: validPeerIds(value.blockedPeerIds),
+    cqt: value.cqt,
+    autoDayPassEnabled: value.autoDayPassEnabled,
+    selectedRouterPackage: value.selectedRouterPackage ?? null,
+    autoRouting: value.autoRouting,
   };
 }
 

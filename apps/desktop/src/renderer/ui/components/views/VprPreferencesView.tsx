@@ -5,18 +5,26 @@ import { routesForSelectedModel } from '../../../modules/catalog/view-models';
 import { peerAccessSummaryLabel } from '../../../modules/routing/peer-access';
 import { buildVprPeerOptions } from '../../../modules/routing/tools';
 import { reputationScaleLabel, sellerMetaLabel, sellerReputationLabel } from '../../../modules/catalog/seller-format';
+import { CQT_LABELS, cqtToPositionIndex, positionIndexToCqt } from '../../../modules/routing/cqt';
+import { AUTO_DAY_PASS_MIN_TRUST_SCORE } from '../../../modules/routing/auto-router';
+import { useCachedResource } from '../../../modules/app/cached-resource';
+import { dayPassPriceIncreaseResource, installedRouterPluginsResource } from '../../../modules/app/vpr-resources';
 import { shallowEqual, useUiSelector } from '../../hooks/useUiSelector';
 import { useActions } from '../../hooks/useActions';
 import { activeThemeMode, applyThemeMode, type ThemeMode } from '../../lib/theme';
 import type { TelemetryStatus } from '../../../../shared/telemetry';
-import { formatUsdShort, VprCard, VprPage, VprSettingRow, VprSlider, VprToggle } from '../vpr/VprKit';
+import { formatUsdShort, VprBadge, VprCard, VprPage, VprSettingRow, VprSlider, VprToggle } from '../vpr/VprKit';
 import { VprPeerAccessDialog } from './VprPeerAccessDialog';
+import { RouterInfoDialog } from '../chat/RouterInfoDialog';
+import type { RouterPluginInfo } from '../../../types/bridge';
 import { usePublicEndpointModal } from '../tunnels/PublicEndpointModal';
 import styles from './VprPreferencesView.module.scss';
 
 type Props = { onSelectView?: (view: import('../../types').ViewName) => void };
 
 const TELEMETRY_DOC_URL = 'https://github.com/AntSeed/antseed/blob/main/docs/telemetry.md';
+
+const GENERIC_ROUTER_DESCRIPTION = 'Select an auto model router to optimise your spend and performance.';
 
 export function VprPreferencesView({ onSelectView }: Props) {
   const actions = useActions();
@@ -60,6 +68,31 @@ export function VprPreferencesView({ onSelectView }: Props) {
       })
       .catch(() => setTelemetryStatus(previousStatus));
   };
+  const [pendingRouterPlugin, setPendingRouterPlugin] = useState<RouterPluginInfo | null>(null);
+  const { data: routerPlugins } = useCachedResource(installedRouterPluginsResource);
+  const availableRouters = routerPlugins ?? [];
+
+  // Reopens the router info dialog on its own once the connect daemon
+  // reports it's capping the active seller's day-pass signing below what
+  // it's actually advertising (day-pass-signing.ts's onPriceCappedChange) --
+  // so re-confirming a price increase doesn't require the buyer to notice a
+  // failed chat request first. Trusts that a currently-active notice is
+  // about whichever router is actually selected, since only one router/
+  // seller relationship is ever active at a time in this app; doesn't
+  // reopen while some other pick is already pending confirmation.
+  const { data: priceIncreaseNotice } = useCachedResource(dayPassPriceIncreaseResource);
+  useEffect(() => {
+    if (!priceIncreaseNotice || pendingRouterPlugin) return;
+    if (!snap.preferences.autoDayPassEnabled || !snap.preferences.selectedRouterPackage) return;
+    const activePlugin = availableRouters.find((r) => r.package === snap.preferences.selectedRouterPackage);
+    if (activePlugin) setPendingRouterPlugin(activePlugin);
+  }, [
+    priceIncreaseNotice,
+    pendingRouterPlugin,
+    snap.preferences.autoDayPassEnabled,
+    snap.preferences.selectedRouterPackage,
+    availableRouters,
+  ]);
 
   const peerOptions = useMemo(
     () => buildVprPeerOptions(snap.lastPeers, snap.discoverRows),
@@ -67,11 +100,22 @@ export function VprPreferencesView({ onSelectView }: Props) {
   );
   const { allowedPeerIds, blockedPeerIds } = snap.preferences;
   const accessSummary = peerAccessSummaryLabel(allowedPeerIds.length, blockedPeerIds.length);
+  // Real gate on the daily day pass and the CQT dial -- a standing,
+  // explicit toggle, not a proxy for whatever model happens to be selected
+  // at this moment.
+  const autoDayPassEnabled = snap.preferences.autoDayPassEnabled ?? false;
 
   const selectTheme = (mode: ThemeMode) => {
     applyThemeMode(mode);
     setThemeMode(mode);
   };
+
+  const selectedRouterPackage = autoDayPassEnabled ? (snap.preferences.selectedRouterPackage ?? null) : null;
+  const routerDescription = useMemo(() => {
+    if (!selectedRouterPackage) return GENERIC_ROUTER_DESCRIPTION;
+    const plugin = availableRouters.find((router) => router.package === selectedRouterPackage);
+    return plugin?.preferencesSummary ?? plugin?.autoRouteInfo?.body ?? plugin?.description ?? GENERIC_ROUTER_DESCRIPTION;
+  }, [selectedRouterPackage, availableRouters]);
 
   const pinnedRoute = useMemo(() => {
     if (snap.selection.mode !== 'pinned-peer' || !snap.selection.peerId) return null;
@@ -89,7 +133,7 @@ export function VprPreferencesView({ onSelectView }: Props) {
           <VprSettingRow
             title="Auto select seller"
             caption="(Price + Trust preference)"
-            hint="Applies to every model set to Auto. Off pauses routing everywhere - providers stay on their last pick."
+            hint="Applies to every model set to Auto. Off pauses routing everywhere - providers stay on their last pick, and also stops the daily router charge below."
             control={(
               <VprToggle
                 checked={snap.preferences.autoRouting}
@@ -98,6 +142,57 @@ export function VprPreferencesView({ onSelectView }: Props) {
               />
             )}
           />
+
+          <div className={styles.routerGroup}>
+            <div className={styles.routerHead}>
+              <span className={styles.routerTitle}>Select model router</span>
+              {autoDayPassEnabled ? <VprBadge tone="green">Router enabled</VprBadge> : null}
+            </div>
+            <select
+              className={styles.routerSelect}
+              value={autoDayPassEnabled ? (snap.preferences.selectedRouterPackage ?? 'none') : 'none'}
+              onChange={(event) => {
+                const nextPackage = event.target.value;
+                if (nextPackage === 'none') {
+                  actions.updateVprRoutingPreferences({ autoDayPassEnabled: false, selectedRouterPackage: null });
+                  return;
+                }
+                const plugin = availableRouters.find((router) => router.package === nextPackage);
+                if (!plugin) return;
+                // Enabling costs real, recurring money -- explain and
+                // confirm before it takes effect. The <select> itself
+                // reverts to "None" on the next render if the user
+                // cancels, since autoDayPassEnabled never changed.
+                setPendingRouterPlugin(plugin);
+              }}
+              aria-label="Select model router"
+            >
+              <option value="none">None</option>
+              {availableRouters.filter((router) => router.autoRouteServiceId).map((router) => (
+                <option key={router.package} value={router.package}>{router.displayName}</option>
+              ))}
+            </select>
+            <div className={styles.routerDescription}>{routerDescription}</div>
+          </div>
+
+          {autoDayPassEnabled ? (
+            <div className={styles.sliderGroup}>
+              <div className={styles.sliderHead}>
+                <span className={styles.sliderTitle}>Cost / quality tradeoff</span>
+                <span className={styles.sliderReadingSmall}>
+                  {CQT_LABELS[cqtToPositionIndex(snap.preferences.cqt)]}
+                </span>
+              </div>
+              <VprSlider
+                min={0}
+                max={CQT_LABELS.length - 1}
+                step={1}
+                value={cqtToPositionIndex(snap.preferences.cqt)}
+                onChange={(next) => actions.updateVprRoutingPreferences({ cqt: positionIndexToCqt(next) })}
+                ariaLabel="Cost / quality tradeoff"
+              />
+            </div>
+          ) : null}
 
           <VprSettingRow
             title="Prefer free peers when available"
@@ -120,14 +215,17 @@ export function VprPreferencesView({ onSelectView }: Props) {
               </span>
             </div>
             <VprSlider
-              min={0}
+              min={autoDayPassEnabled ? AUTO_DAY_PASS_MIN_TRUST_SCORE : 0}
               max={100}
               step={5}
               value={snap.preferences.minTrustScore}
               onChange={(next) => actions.updateVprRoutingPreferences({ minTrustScore: next })}
               ariaLabel="Minimum trust score"
             />
-            <div className={styles.sliderHint}>Providers rated below this are never used</div>
+            <div className={styles.sliderHint}>
+              Providers rated below this are never used
+              {autoDayPassEnabled ? ' — locked to 7.0+ while a model router is selected' : ''}
+            </div>
           </div>
 
           <div className={styles.sliderGroup}>
@@ -300,6 +398,23 @@ export function VprPreferencesView({ onSelectView }: Props) {
         peerOptions={peerOptions}
         onSetListing={actions.setVprPeerListing}
         onClearAllowlist={() => actions.updateVprRoutingPreferences({ allowedPeerIds: [] })}
+      />
+
+      <RouterInfoDialog
+        isOpen={pendingRouterPlugin !== null}
+        plugin={pendingRouterPlugin}
+        onClose={() => setPendingRouterPlugin(null)}
+        onConfirm={() => {
+          if (!pendingRouterPlugin) return;
+          actions.updateVprRoutingPreferences({
+            autoDayPassEnabled: true,
+            selectedRouterPackage: pendingRouterPlugin.package,
+            ...(snap.preferences.minTrustScore < AUTO_DAY_PASS_MIN_TRUST_SCORE
+              ? { minTrustScore: AUTO_DAY_PASS_MIN_TRUST_SCORE }
+              : {}),
+          });
+          setPendingRouterPlugin(null);
+        }}
       />
     </section>
   );

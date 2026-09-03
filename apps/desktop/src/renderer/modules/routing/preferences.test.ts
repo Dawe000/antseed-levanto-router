@@ -21,6 +21,8 @@ const fallbackPreferences: VprRoutingPreferences = {
   minTrustScore: 60,
   allowedPeerIds: [],
   blockedPeerIds: [],
+  cqt: 5,
+  autoDayPassEnabled: false,
 };
 
 test('migrates the previous zero default to the new 6.0 minimum', () => {
@@ -78,6 +80,9 @@ test('valid VPR preferences and route selection save and load', () => {
     minTrustScore: 62,
     allowedPeerIds: ['peer-1'],
     blockedPeerIds: ['peer-2', 'peer-3'],
+    cqt: 7,
+    autoDayPassEnabled: true,
+    selectedRouterPackage: '@antseed/router-custom',
   };
   const routeSelection: VprRouteSelection = {
     model: {
@@ -97,14 +102,79 @@ test('valid VPR preferences and route selection save and load', () => {
   assert.deepEqual(loadVprRouteSelection(fallbackRouteSelection), routeSelection);
 });
 
-test('buyer config projection excludes the Desktop-only auto-routing toggle', () => {
+test('buyer config projection includes every field an installed router plugin\'s payment gate reads', () => {
   assert.deepEqual(buyerModelRoutingPreferences(fallbackPreferences), {
     preferFreePeers: fallbackPreferences.preferFreePeers,
     maxInputUsdPerMillion: fallbackPreferences.maxInputUsdPerMillion,
     minTrustScore: fallbackPreferences.minTrustScore,
     allowedPeerIds: fallbackPreferences.allowedPeerIds,
     blockedPeerIds: fallbackPreferences.blockedPeerIds,
+    cqt: fallbackPreferences.cqt,
+    autoDayPassEnabled: fallbackPreferences.autoDayPassEnabled,
+    selectedRouterPackage: null,
+    autoRouting: fallbackPreferences.autoRouting,
   });
+});
+
+test('buyer config projection forwards autoRouting -- an installed router\'s real-money signing can gate on this too', () => {
+  // Regression: a buyer trying to stop day-pass billing reasonably
+  // reached for the "Auto select seller" switch instead of the separate
+  // control that owns autoDayPassEnabled, and billing kept running
+  // because this field used to be dropped from the projection entirely.
+  const projected = buyerModelRoutingPreferences({ ...fallbackPreferences, autoRouting: false });
+  assert.equal(projected.autoRouting, false);
+});
+
+test('buyer config projection forwards which router plugin is selected -- process-manager.ts reads this back to decide which router to start', () => {
+  const projected = buyerModelRoutingPreferences({
+    ...fallbackPreferences,
+    autoDayPassEnabled: true,
+    selectedRouterPackage: '@antseed/router-custom',
+  });
+  assert.equal(projected.selectedRouterPackage, '@antseed/router-custom');
+});
+
+test('selectedRouterPackage stays unselected when absent from stored preferences, regardless of autoDayPassEnabled', () => {
+  for (const autoDayPassEnabled of [true, false]) {
+    localStorage.setItem(
+      VPR_PREFERENCES_STORAGE_KEY,
+      JSON.stringify({ ...fallbackPreferences, autoDayPassEnabled }),
+    );
+    assert.equal(loadVprRoutingPreferences(fallbackPreferences).selectedRouterPackage, null);
+  }
+});
+
+test('an explicit "None" (selectedRouterPackage: null) stays unselected regardless of autoDayPassEnabled', () => {
+  for (const autoDayPassEnabled of [true, false]) {
+    localStorage.setItem(
+      VPR_PREFERENCES_STORAGE_KEY,
+      JSON.stringify({ ...fallbackPreferences, autoDayPassEnabled, selectedRouterPackage: null }),
+    );
+    assert.equal(loadVprRoutingPreferences(fallbackPreferences).selectedRouterPackage, null);
+  }
+});
+
+test('buyer config projection forwards the day-pass-enable toggle -- real money gate, must not drop silently', () => {
+  const projected = buyerModelRoutingPreferences({ ...fallbackPreferences, autoDayPassEnabled: true });
+  assert.equal(projected.autoDayPassEnabled, true);
+});
+
+test('cqt dial value round-trips through save/load', () => {
+  saveVprRoutingPreferences({ ...fallbackPreferences, cqt: 9 });
+  assert.equal(loadVprRoutingPreferences(fallbackPreferences).cqt, 9);
+});
+
+test('an invalid stored cqt value falls back to the default rather than an off-scale number', () => {
+  localStorage.setItem(
+    VPR_PREFERENCES_STORAGE_KEY,
+    JSON.stringify({ ...fallbackPreferences, cqt: 4 }), // not one of {1,3,5,7,9}
+  );
+  assert.equal(loadVprRoutingPreferences(fallbackPreferences).cqt, fallbackPreferences.cqt);
+});
+
+test('buyer config projection forwards the cqt dial value', () => {
+  const projected = buyerModelRoutingPreferences({ ...fallbackPreferences, cqt: 3 });
+  assert.equal(projected.cqt, 3);
 });
 
 test('buyer config projection drops malformed peer ids before writing config', () => {

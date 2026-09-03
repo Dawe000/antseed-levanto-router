@@ -32,6 +32,12 @@ const DEFAULT_CONFIG: Record<string, unknown> = {
     minPeerReputation: DESKTOP_DEFAULT_MIN_PEER_REPUTATION,
     routingPreferences: {
       ...DEFAULT_MODEL_ROUTING_PREFERENCES,
+      // selectedRouterPackage stays DEFAULT_MODEL_ROUTING_PREFERENCES's own
+      // null on a fresh profile -- no router plugin is loaded, and no
+      // connect-mode Auto entry is offered, until the user picks one in
+      // Preferences. Every reader of this field (process-manager.ts,
+      // auto-router.ts, preferences.ts's own migration path below) treats an
+      // absent/null value the same way: nothing selected.
       allowedPeerIds: [],
       blockedPeerIds: [],
     },
@@ -157,7 +163,15 @@ function migrateDesktopBuyerDefaults(config: Record<string, unknown>): {
 
   const allowedPeerIds = validRoutingPeerIds(routingPreferences.allowedPeerIds);
   const blockedPeerIds = validRoutingPeerIds(routingPreferences.blockedPeerIds);
+  // Spread the existing object first -- this literal only validates/defaults
+  // the five fields below; without the spread, every OTHER field on
+  // ModelRoutingPreferences (cqt, dayPassOnDemandEnabled) would silently
+  // drop whenever this migration fires for an unrelated reason, since a
+  // narrower reconstructed object simply never has them -- resetting a
+  // user's Auto-routing toggle (dayPassOnDemandEnabled) to off on every app
+  // launch, with no error.
   const nextRoutingPreferences = {
+    ...routingPreferences,
     preferFreePeers: typeof routingPreferences.preferFreePeers === 'boolean'
       ? routingPreferences.preferFreePeers
       : DEFAULT_MODEL_ROUTING_PREFERENCES.preferFreePeers,
