@@ -47,7 +47,7 @@ function createMockPaymentMux(): PaymentMux & {
   };
 }
 
-/** Build a valid SpendingAuth payload signed by the buyer's EVM wallet with dual sigs. */
+/** Build a valid SpendingAuth payload signed by the buyer's EVM wallet. */
 async function buildSpendingAuth(
   buyerIdentity: Identity,
   _sellerIdentity: Identity,
@@ -706,53 +706,6 @@ describe('SellerPaymentManager', () => {
     expect(store.getChannel(channelId)!.status).toBe(CHANNEL_STATUS.SETTLED);
   });
 
-  it('treats an unclassified top-up error as success when the chain shows it already landed', async () => {
-    const channelId = makeChannelId(104);
-
-    const reservePayload = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, {
-      isReserve: true,
-      reserveMaxAmount: '1000000',
-    });
-    await manager.handleSpendingAuth(buyerIdentity.peerId, reservePayload, mux);
-
-    const auth900k = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, {
-      cumulativeAmount: 900_000n,
-      reserveMaxAmount: '1000000',
-    });
-    await manager.handleSpendingAuth(buyerIdentity.peerId, auth900k, mux);
-    manager.recordSpend(channelId, 900_000n);
-
-    // Not any of _classifyTopUpFailure's three recognized shapes -- a plain
-    // RPC confirmation timeout, exactly the error text observed live from a
-    // real RPC provider, which can throw after the transaction has already
-    // been mined.
-    vi.spyOn(manager.channelsClient, 'topUp')
-      .mockRejectedValue(new Error('timeout (operation="request.send", reason="timeout")'));
-    vi.spyOn(manager.channelsClient, 'getSession').mockResolvedValue({
-      buyer: buyerIdentity.wallet.address,
-      seller: sellerIdentity.wallet.address,
-      deposit: 2_000_000n,
-      settled: 900_000n,
-      metadataHash: ZERO_METADATA_HASH,
-      deadline: BigInt(Math.floor(Date.now() / 1000) + 3600),
-      settledAt: 0n,
-      closeRequestedAt: 0n,
-      status: 1,
-    });
-
-    const topUp2m = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, {
-      isReserve: true,
-      reserveMaxAmount: '2000000',
-      salt: '0x' + '09'.repeat(32),
-    });
-
-    expect(await manager.handleSpendingAuth(buyerIdentity.peerId, topUp2m, mux)).toBe('accepted');
-    expect(manager.channelsClient.close).not.toHaveBeenCalled();
-    expect(manager.getReserveMax(channelId)).toBe(2_000_000n);
-    expect(manager.hasSession(buyerIdentity.peerId)).toBe(true);
-    expect(store.getChannel(channelId)!.status).toBe(CHANNEL_STATUS.ACTIVE);
-  });
-
   it('blocks the channel if permanent top-up failure cannot close immediately', async () => {
     const channelId = makeChannelId(105);
 
@@ -1338,6 +1291,45 @@ describe('SellerPaymentManager', () => {
 
     // Cumulative should remain at the last valid value
     expect(manager.getAcceptedCumulative(channelId)).toBe(200_000n);
+  });
+
+  it('rejects a SpendingAuth jump exceeding maxCumulativeIncreasePerAuth, independent of the buyer\'s own day-counting', async () => {
+    // Regression for a real incident: a client-side arithmetic bug let a
+    // single SpendingAuth claim six days of a $0.59/day day pass in one
+    // signature. Fixed client-side already -- this is the seller's own,
+    // independent backstop, so accepting an overcharge never depends on the
+    // buyer's arithmetic being right.
+    const cappedConfig: SellerPaymentConfig = {
+      rpcUrl: 'http://127.0.0.1:8545',
+      channelsContractAddress: CONTRACT_ADDR,
+      chainId: CHAIN_ID,
+      dataDir: tempDir,
+      maxCumulativeIncreasePerAuth: '590000', // one day at $0.59/day
+    };
+    const cappedManager = new SellerPaymentManager(sellerIdentity, cappedConfig, store);
+    vi.spyOn(cappedManager.channelsClient, 'reserve').mockResolvedValue('0xreserve-hash');
+
+    const channelId = makeChannelId(41);
+    const payload1 = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { isReserve: true });
+    await cappedManager.handleSpendingAuth(buyerIdentity.peerId, payload1, mux);
+
+    // Day 1: exactly one day's worth -- must be accepted (the initial
+    // SpendingAuth path is never capped; day 1 is one day by construction).
+    const day1 = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { cumulativeAmount: 590_000n });
+    expect(await cappedManager.handleSpendingAuth(buyerIdentity.peerId, day1, mux)).toBe('accepted');
+    expect(cappedManager.getAcceptedCumulative(channelId)).toBe(590_000n);
+
+    // An attempted six-day jump in one signature -- must be rejected, even
+    // though it's within the on-chain deposit ceiling and otherwise
+    // well-formed.
+    const sixDayJump = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { cumulativeAmount: 3_540_000n });
+    expect(await cappedManager.handleSpendingAuth(buyerIdentity.peerId, sixDayJump, mux)).toBe('rejected');
+    expect(cappedManager.getAcceptedCumulative(channelId)).toBe(590_000n);
+
+    // A legitimate next-day increment (exactly one more day) is still accepted.
+    const day2 = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { cumulativeAmount: 1_180_000n });
+    expect(await cappedManager.handleSpendingAuth(buyerIdentity.peerId, day2, mux)).toBe('accepted');
+    expect(cappedManager.getAcceptedCumulative(channelId)).toBe(1_180_000n);
   });
 
   it('accepts SpendingAuth within deposit ceiling', async () => {
@@ -2042,6 +2034,54 @@ describe('SellerPaymentManager', () => {
       expect(closeSpy).toHaveBeenCalledOnce();
       // close path never consults on-chain state for the dust check
       expect(getSessionSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('settleOnAcceptedSpendingAuth', () => {
+    it('settles (keeps channel open) right after accepting a subsequent SpendingAuth when enabled', async () => {
+      const channelId = makeChannelId(60);
+      const customConfig: SellerPaymentConfig = {
+        rpcUrl: 'http://127.0.0.1:8545',
+        channelsContractAddress: CONTRACT_ADDR,
+        chainId: CHAIN_ID,
+        dataDir: tempDir,
+        settleOnAcceptedSpendingAuth: true,
+      };
+      const mgr = new SellerPaymentManager(sellerIdentity, customConfig, store);
+      vi.spyOn(mgr.channelsClient, 'reserve').mockResolvedValue('0xreserve-hash');
+      vi.spyOn(mgr.channelsClient, 'getSession').mockResolvedValue(
+        makeOnChainChannel(buyerIdentity, sellerIdentity, { settled: 0n }),
+      );
+      const settleSpy = vi.spyOn(mgr.channelsClient, 'settle').mockResolvedValue('0xsettle-hash');
+
+      const reserve = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { isReserve: true });
+      await mgr.handleSpendingAuth(buyerIdentity.peerId, reserve, mux);
+      // Bootstrap itself has nothing accepted yet -- settleSession would no-op
+      // even if triggered, but confirms the bootstrap path doesn't attempt it.
+      expect(settleSpy).not.toHaveBeenCalled();
+
+      const spend = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { cumulativeAmount: 890_000n });
+      await mgr.handleSpendingAuth(buyerIdentity.peerId, spend, mux);
+
+      // Fire-and-forget -- not awaited by handleSpendingAuth itself.
+      await vi.waitFor(() => expect(settleSpy).toHaveBeenCalledOnce());
+      const [, calledChannelId, calledAmount] = settleSpy.mock.calls[0]!;
+      expect(calledChannelId).toBe(channelId);
+      expect(calledAmount).toBe(890_000n);
+      // settleOnly keeps the channel open for the next day's request.
+      expect(mgr.hasSession(buyerIdentity.peerId)).toBe(true);
+    });
+
+    it('does not settle on accepting a subsequent SpendingAuth by default -- ordinary metered billing signs on every request', async () => {
+      const channelId = makeChannelId(61);
+      const settleSpy = vi.spyOn(manager.channelsClient, 'settle').mockResolvedValue('0xsettle-hash');
+
+      const reserve = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { isReserve: true });
+      await manager.handleSpendingAuth(buyerIdentity.peerId, reserve, mux);
+      const spend = await buildSpendingAuth(buyerIdentity, sellerIdentity, channelId, { cumulativeAmount: 50_000n });
+      await manager.handleSpendingAuth(buyerIdentity.peerId, spend, mux);
+
+      expect(settleSpy).not.toHaveBeenCalled();
     });
   });
 

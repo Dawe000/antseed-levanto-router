@@ -178,7 +178,7 @@ export interface NodePaymentsConfig {
   chainId?: number;
   /** Default maximum USDC per spending auth. Default: 500000 ($0.50) */
   defaultMaxAmountUsdc?: string;
-  /** Default auth duration in seconds. Default: 90000 */
+  /** Default auth duration in seconds. Default: 900 (15 min) -- seller must call reserve() promptly. */
   defaultAuthDurationSecs?: number;
   /** Minimum USDC per request (base units) for seller. Default: "10000" ($0.01). */
   minBudgetPerRequest?: string;
@@ -186,11 +186,46 @@ export interface NodePaymentsConfig {
   minSettleDelta?: string;
   /** Serve channels whose buyer already requested close on-chain, risking uncollectible work. Default: false. */
   serveWhileClosePending?: boolean;
+  /**
+   * Seller-side: rejects any single SpendingAuth whose cumulativeAmount jumps
+   * more than this many base units above the previously accepted cumulative
+   * for that channel. Undefined (default) means no cap -- ordinary metered
+   * per-request billing can legitimately jump by any amount in a burst of
+   * real usage, so this must stay opt-in, not a blanket default. A seller
+   * offering a flat daily/periodic day-pass price should set this to that
+   * price: it's an independent server-side backstop against a single
+   * signature ever claiming several days' worth in one call, so the seller
+   * never has to trust the buyer's arithmetic alone.
+   */
+  maxCumulativeIncreasePerAuth?: string;
+  /**
+   * Seller-side: settle and close a channel the instant its buyer's live
+   * connection drops. Default: true — correct for ordinary per-session
+   * inference, where a dropped connection means the conversation is over.
+   * Wrong for a day-pass-priced channel meant to persist across many
+   * short connect/disconnect cycles between infrequent requests — set false
+   * there, or a signed day pass gets torn down the moment the buyer's
+   * connection goes idle, before the next real request ever arrives.
+   */
+  settleOnDisconnect?: boolean;
+  /**
+   * Seller-side: settle (keep channel open) immediately after accepting a
+   * subsequent SpendingAuth. Default: false/undefined -- ordinary metered
+   * per-request billing signs a fresh cumulative on every response, so this
+   * must stay opt-in or every request would trigger an on-chain tx. Meant
+   * for a day-pass-priced channel (roughly one signature per ~24h window),
+   * where neither of the two existing settlement triggers ever fires:
+   * SellerSessionTracker's idle-settle only activates for channels served
+   * through the metered request path, and settleOnDisconnect is correctly
+   * false for this kind of channel already -- without this, an accepted
+   * cumulative amount can sit authorized-but-never-settled indefinitely.
+   */
+  settleOnAcceptedSpendingAuth?: boolean;
   /** Optional seller-side slack for estimate-only reserve preflight checks. Unset disables estimate-only rejection. */
   reserveEstimateOverdraftUsdc?: string;
   /** Maximum USDC the buyer authorizes per single request (base units). Default: "500000" ($0.50). */
   maxPerRequestUsdc?: string;
-  /** Maximum total USDC the buyer will reserve in a single SpendingAuth (base units). Default: "10000000" ($10.00). */
+  /** Maximum total USDC the buyer will reserve in a single SpendingAuth (base units). Default: "1000000" ($1.00) -- matches FIRST_SIGN_CAP. */
   maxReserveAmountUsdc?: string;
   /** Disable per-service buyer attribution in metadata v2. Default: false. */
   disableMetadataV2Services?: boolean;
@@ -224,19 +259,6 @@ export interface NodeConfig {
   displayName?: string;
   /** Publicly reachable seller address override ("host:port") announced in metadata. */
   publicAddress?: string;
-  /**
-   * Local-development escape hatch: known peerId -> "host:port" endpoints to
-   * fetch metadata from directly, bypassing DHT-based address discovery for
-   * exactly those peers. DHT announce/lookup records a peer's *observed*
-   * source address; a buyer and seller on the same machine are recorded
-   * under that machine's own public-facing address, which is unreachable
-   * from itself under NAT hairpinning (near-universal under WSL2's extra
-   * NAT layer). Every other guarantee (schema validation, signature
-   * verification, peerId match) is unchanged -- this only replaces how the
-   * endpoint is found, not how the fetched metadata is trusted. NOT a
-   * production NAT-traversal mechanism; undefined/empty is a no-op.
-   */
-  directPeerAddresses?: Record<string, string>;
   /** External ownership claims announced in signed peer metadata. */
   verifications?: PeerVerifications;
   /** Extra peer capability strings to advertise (e.g. supported verifier SDKs). */
@@ -496,8 +518,8 @@ export class AntseedNode extends EventEmitter {
    * read after a `topUpReserve()` call -- `topUpReserve`'s own AuthAck
    * doesn't update the buyer's cached reserve ceiling for anything but the
    * very first reserve (confirmed by reading `BuyerPaymentManager.handleAuthAck`);
-   * `reconcileReserveAmount(sellerPeerId, onChainAmount)` is the documented
-   * way to resync from here (model-routing decisions doc SS13 item 11).
+   * `reconcileReserveAmount(sellerPeerId, onChainAmount)` is the way to
+   * resync from here.
    */
   get channelsClient(): ChannelsClient | null {
     return this._channelsClient;
@@ -1002,21 +1024,6 @@ export class AntseedNode extends EventEmitter {
       return null;
     }
 
-    const directAddress = this._config.directPeerAddresses?.[normalized];
-    if (directAddress) {
-      debugLog(`[Node] findPeer(${normalized.slice(0, 12)}...) via configured direct address ${directAddress}`);
-      const { host, port } = parsePeerAddress(directAddress);
-      const direct = await this._peerLookup.resolveKnownPeer(normalized, { host, port });
-      if (direct) {
-        const peer = this._lookupResultToPeerInfo(direct);
-        this._attachCachedExternalVerificationResults([peer]);
-        this._queueExternalVerification([peer]);
-        await this._enrichPeersWithOnChainStats([peer]);
-        return peer;
-      }
-      debugWarn(`[Node]   direct address ${directAddress} for ${normalized.slice(0, 12)}... did not resolve; falling back to DHT`);
-    }
-
     debugLog(`[Node] findPeer(${normalized.slice(0, 12)}...) via per-peer DHT topic`);
     let results = await this._peerLookup.findByPeerId(normalized);
     if (results.length === 0) {
@@ -1041,54 +1048,6 @@ export class AntseedNode extends EventEmitter {
     this._queueExternalVerification([peer]);
     await this._enrichPeersWithOnChainStats([peer]);
     return peer;
-  }
-
-  /**
-   * Resolve every peer configured via `directPeerAddresses` (the local-dev
-   * NAT-hairpinning escape hatch — see that field's own doc comment) without
-   * touching the DHT at all, the same way `findPeer`'s direct-address branch
-   * does for a single known peer. Used to seed the general peer catalog
-   * (buyer-proxy's `_getPeers`) with peers a DHT crawl genuinely cannot find
-   * on this machine, so Discover/model-picker aren't empty just because
-   * local-only discovery doesn't work here.
-   *
-   * A no-op returning `[]` when `directPeerAddresses` is unset/empty — real
-   * production buyers never configure this, so this method costs them
-   * nothing. Failures resolve individual entries to nothing rather than
-   * rejecting the whole batch; one misconfigured/unreachable direct peer
-   * must not blank out the others.
-   */
-  async resolveDirectPeers(): Promise<PeerInfo[]> {
-    const entries = Object.entries(this._config.directPeerAddresses ?? {});
-    if (entries.length === 0) return [];
-    if (!this._peerLookup) {
-      throw buyerFault("Node not started or not in buyer mode", "node-not-started");
-    }
-
-    const resolved = await Promise.all(entries.map(async ([peerId, address]) => {
-      const normalized = peerId.trim().toLowerCase().replace(/^0x/, "");
-      if (!/^[0-9a-f]{40}$/.test(normalized)) return null;
-      try {
-        const { host, port } = parsePeerAddress(address);
-        const direct = await this._peerLookup!.resolveKnownPeer(normalized, { host, port });
-        if (!direct) {
-          debugWarn(`[Node] resolveDirectPeers: direct address ${address} for ${normalized.slice(0, 12)}... did not resolve`);
-          return null;
-        }
-        return this._lookupResultToPeerInfo(direct);
-      } catch (err) {
-        debugWarn(`[Node] resolveDirectPeers: failed to resolve ${normalized.slice(0, 12)}... at ${address}: ${err instanceof Error ? err.message : String(err)}`);
-        return null;
-      }
-    }));
-
-    const peers = resolved.filter((p): p is PeerInfo => p !== null);
-    if (peers.length > 0) {
-      this._attachCachedExternalVerificationResults(peers);
-      this._queueExternalVerification(peers);
-      await this._enrichPeersWithOnChainStats(peers);
-    }
-    return peers;
   }
 
   /**
@@ -1152,9 +1111,11 @@ export class AntseedNode extends EventEmitter {
           ? Number(volumeMicros)
           : Number.MAX_SAFE_INTEGER;
         p.onChainLastSettledAtSec = stats.lastSettledAt;
-        // Some migrated/facade staking accounts return zero for `stakedAt`,
-        // and transient RPC failures used to be coerced to zero as well. A
-        // zero read must not erase a previously verified positive timestamp.
+        // Some migrated/facade staking accounts return zero for `stakedAt`.
+        // A zero read must not erase a previously verified positive
+        // timestamp (an RPC failure is caught to `null` above and returns
+        // before reaching here, so this guard only needs to cover that
+        // zero-account case).
         if (typeof stakedAt === 'number' && Number.isFinite(stakedAt) && stakedAt > 0) {
           p.onChainStakedAtSec = stakedAt;
         }
@@ -1215,11 +1176,11 @@ export class AntseedNode extends EventEmitter {
   /**
    * Get (connecting first if needed) a real `PaymentMux` for a specific
    * peer, for buyer-side code outside this class that needs to sign and
-   * send payment messages to a peer it isn't necessarily chatting through
-   * (model-routing decisions doc SS13 item 11) -- e.g. a routing-client
-   * host paying a flat daily day-pass fee to a routing peer, as opposed
-   * to per-request billing to a chat-completion seller. `_paymentMuxes` has
-   * no public getter otherwise; mirrors `requestChannelClose`'s own
+   * send payment messages to a peer it isn't necessarily chatting through --
+   * e.g. a routing-client host paying a flat daily day-pass fee to a
+   * routing peer, as opposed to per-request billing to a chat-completion
+   * seller. `_paymentMuxes` has no public getter otherwise; mirrors
+   * `requestChannelClose`'s own
    * find-then-`connectToPeer` pattern.
    */
   async getOrConnectPaymentMux(peerId: string): Promise<PaymentMux> {
@@ -1527,10 +1488,6 @@ export class AntseedNode extends EventEmitter {
       reannounceIntervalMs: DEFAULT_DHT_CONFIG.reannounceIntervalMs,
       operationTimeoutMs: this._config.dhtOperationTimeoutMs ?? DEFAULT_DHT_CONFIG.operationTimeoutMs,
       allowPrivateIPs: this._config.allowPrivateIPs,
-      // Isolated local testing must not be reachable from the LAN/WAN --
-      // noOfficialBootstrap already means "never dial the real network", so
-      // reuse it here to also mean "never accept a connection from it".
-      ...(this._config.noOfficialBootstrap ? { bindHost: "127.0.0.1" } : {}),
     };
   }
 
@@ -1715,33 +1672,26 @@ export class AntseedNode extends EventEmitter {
     await this._connectionManager.startListening({
       peerId: identity.peerId,
       port: signalingPort,
-      host: this._config.noOfficialBootstrap ? "127.0.0.1" : "0.0.0.0",
+      host: "0.0.0.0",
     });
 
     // Resolve actual bound port (important when port 0 is used for OS-assigned)
     const actualSignalingPort = this._connectionManager.getListeningPort() ?? signalingPort;
     const actualDhtPort = this._dht.getPort();
 
-    // NAT traversal: automatically map ports via UPnP/NAT-PMP. Skipped for
-    // isolated local testing (noOfficialBootstrap) -- mapping a port on the
-    // router is exactly the reachability this mode exists to prevent, and
-    // it would defeat the loopback bind above.
-    if (this._config.noOfficialBootstrap) {
-      debugLog("[NAT] Skipped — noOfficialBootstrap is set (isolated local testing)");
-    } else {
-      this._nat = new NatTraversal();
-      const natResult = await this._nat.mapPorts([
-        { port: actualSignalingPort, protocol: "TCP" },
-        { port: actualDhtPort, protocol: "UDP" },
-      ]);
+    // NAT traversal: automatically map ports via UPnP/NAT-PMP
+    this._nat = new NatTraversal();
+    const natResult = await this._nat.mapPorts([
+      { port: actualSignalingPort, protocol: "TCP" },
+      { port: actualDhtPort, protocol: "UDP" },
+    ]);
 
-      if (natResult.success) {
-        this.emit("nat:mapped", natResult);
-      } else {
-        debugWarn("[NAT] UPnP/NAT-PMP mapping failed — seller may not be reachable from the internet");
-        debugWarn("[NAT] Ensure port forwarding is configured manually, or peers on the same LAN can still connect");
-        this.emit("nat:failed");
-      }
+    if (natResult.success) {
+      this.emit("nat:mapped", natResult);
+    } else {
+      debugWarn("[NAT] UPnP/NAT-PMP mapping failed — seller may not be reachable from the internet");
+      debugWarn("[NAT] Ensure port forwarding is configured manually, or peers on the same LAN can still connect");
+      this.emit("nat:failed");
     }
 
     // Set up announcer for providers
@@ -2207,6 +2157,9 @@ export class AntseedNode extends EventEmitter {
         ...(payments.serveWhileClosePending !== undefined
           ? { serveWhileClosePending: payments.serveWhileClosePending }
           : {}),
+        ...(payments.settleOnDisconnect !== undefined ? { settleOnDisconnect: payments.settleOnDisconnect } : {}),
+        ...(payments.settleOnAcceptedSpendingAuth !== undefined ? { settleOnAcceptedSpendingAuth: payments.settleOnAcceptedSpendingAuth } : {}),
+        ...(payments.maxCumulativeIncreasePerAuth ? { maxCumulativeIncreasePerAuth: payments.maxCumulativeIncreasePerAuth } : {}),
       };
       this._sellerPaymentManager = new SellerPaymentManager(this._identity, sellerConfig, this._channelStore);
       debugLog(`[Node] SellerPaymentManager initialized`);

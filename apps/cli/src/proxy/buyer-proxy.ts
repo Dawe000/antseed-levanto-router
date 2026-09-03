@@ -7,6 +7,7 @@ import {
   ANTSEED_BUYER_FAULT_ERROR_CODE,
   ANTSEED_FAULT_ATTRIBUTION_HEADER,
   ANTSEED_ATTEST_PATH,
+  buildNetworkServiceOffers,
   adaptPeerFaultErrorResponse,
   computeOnChainReputationScore,
   decodeSweepRequest,
@@ -162,6 +163,17 @@ export interface BuyerProxyConfig {
    * savings (Acme)". Undefined falls back to a generic title.
    */
   routerName?: string
+  /**
+   * Live read of whatever day-pass-signing.ts's `onPriceCappedChange` most
+   * recently reported (`null` when no seller's live price is currently
+   * being capped) -- exposed via `GET /_antseed/day-pass-price-increase` so
+   * the desktop app can poll it and reopen its router info dialog on its
+   * own, without the user having to notice a failed request first. A
+   * getter, not a plain value, since day-pass-signing.ts's signing cycle
+   * (which produces this) runs entirely independently of any single HTTP
+   * request this proxy handles.
+   */
+  getDayPassPriceIncreaseNotice?: () => { sellerPeerId: string; agreedUsd: number; discoveredUsd: number } | null
 }
 
 // 401/403 are included: sellers relay upstream auth failures (revoked or
@@ -764,6 +776,7 @@ export class BuyerProxy {
   private readonly _stateFile: string
   private readonly _configPath: string | null
   private readonly _routerName: string | undefined
+  private readonly _getDayPassPriceIncreaseNotice: (() => { sellerPeerId: string; agreedUsd: number; discoveredUsd: number } | null) | undefined
   private _stateFileWatching = false
   private _configFileWatching = false
   private _pinnedPeer: string | null
@@ -861,6 +874,7 @@ export class BuyerProxy {
     this._stateFile = join(config.dataDir, 'buyer.state.json')
     this._configPath = config.configPath ?? null
     this._routerName = config.routerName
+    this._getDayPassPriceIncreaseNotice = config.getDayPassPriceIncreaseNotice
     this._conversations = new ConversationStore(config.dataDir)
     this._pinnedPeer = config.pinnedPeerId?.toLowerCase() ?? null
     this._routingPreferences = config.routingPreferences
@@ -1134,9 +1148,8 @@ export class BuyerProxy {
         + `autoDayPassEnabled=${next.autoDayPassEnabled ?? false}`,
       )
       // Toggling the day pass on/off, by itself, causes zero network or
-      // signing activity (runlog 2026-09-02: postpaid, usage-only billing --
-      // the only trigger is a real routing dispatch caused by an actual
-      // prompt). Nothing fires here anymore.
+      // signing activity -- the only trigger is a real routing dispatch
+      // caused by an actual prompt.
     } catch (err) {
       log(`Routing preferences reload ignored: ${err instanceof Error ? err.message : String(err)}`)
     }
@@ -1999,6 +2012,37 @@ export class BuyerProxy {
       return
     }
 
+    if (path === '/_antseed/day-pass-price' && method === 'GET') {
+      // Generic read of any discovered peer's advertised `type: 'day-pass'`
+      // offer -- for a router plugin's Auto Preferences toggle to show a
+      // real, live daily price instead of a bare "starts a day pass" with no
+      // number. `null` (not an error) whenever no such offer has been
+      // discovered yet -- a buyer who hasn't found a routing peer over the
+      // network, or one advertising nothing, sees the generic copy rather
+      // than a broken price.
+      const peers = await this._getPeers()
+      const offer = buildNetworkServiceOffers(peers).find((o) => o.type === 'day-pass' && o.flatUsdPrice !== undefined) ?? null
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        ok: true,
+        offer: offer ? { peerId: offer.peerId, flatUsdPrice: offer.flatUsdPrice } : null,
+      }))
+      return
+    }
+
+    if (path === '/_antseed/day-pass-price-increase' && method === 'GET') {
+      // Whether day-pass-signing.ts is currently capping some seller's
+      // signing at a price below what it's actually advertising -- lets a
+      // host UI (desktop's router info dialog) reopen itself on its own the
+      // moment this becomes true, instead of the buyer only finding out
+      // once a routed request happens to fail. `null` (not an error)
+      // whenever nothing is currently capped.
+      const notice = this._getDayPassPriceIncreaseNotice?.() ?? null
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, notice }))
+      return
+    }
+
     const meteringMatch = path.match(/^\/_antseed\/metering\/(.+)$/)
     if (meteringMatch && method === 'GET') {
       const sellerPeerId = decodeURIComponent(meteringMatch[1]!)
@@ -2343,7 +2387,7 @@ export class BuyerProxy {
     // model through untouched on every request -- substituting the
     // previously-routed model here would run the request against a fixed
     // seller before the router plugin ever saw it, permanently bypassing its
-    // own (correct) continuation logic. See model-routing-runlog.md.
+    // own (correct) continuation logic.
     const chatPinnedModel = storedConversation?.peerSource === 'user'
       ? storedConversation.pinnedModel
       : null
@@ -2529,8 +2573,8 @@ export class BuyerProxy {
     // claims this request's model. Declining (null) — including simply not
     // implementing the method, or a concrete model the router doesn't
     // recognize as its own sentinel — falls straight through to the
-    // unmodified pipeline below (software-arch doc SS2.1), identical to
-    // today for every request a router doesn't claim. Host code carries no
+    // unmodified pipeline below, identical to today for every request a
+    // router doesn't claim. Host code carries no
     // knowledge of any sentinel string; that's entirely the plugin's
     // business. Called at most once per request — selectRoute can have real
     // side effects (payment signing, ledger recording), so this must never
@@ -2577,8 +2621,8 @@ export class BuyerProxy {
 
       if (routeSelected) {
         // The routing peer's returned order already *is* the score/quality/
-        // cost decision (decisions doc SS4.4) — walk it as given, no local
-        // re-ranking or reputation re-sort (software-arch doc SS2.4).
+        // cost decision -- walk it as given, no local re-ranking or
+        // reputation re-sort.
         candidates = routeSelected.map((candidate) => ({
           ...candidate,
           effectiveReputationScore: candidate.reputation,
@@ -3336,10 +3380,9 @@ export class BuyerProxy {
             estimatedCostUsd: telemetry.estimatedCostUsd,
             requestId: requestForPeer.requestId,
           })
-          // Cache "warmth" feed (model-routing software-arch doc SS4.3) --
-          // not part of the generic onResult() shape above, since most
-          // routers have no use for it; an optional per-plugin extension,
-          // called only when a router implements it.
+          // Cache "warmth" feed -- not part of the generic onResult() shape
+          // above, since most routers have no use for it; an optional
+          // per-plugin extension, called only when a router implements it.
           if (conversation && requestedService) {
             router.recordObservedCache?.(
               conversation,
@@ -3449,10 +3492,9 @@ export class BuyerProxy {
             estimatedCostUsd: telemetry.estimatedCostUsd,
             requestId: requestForPeer.requestId,
           })
-          // Cache "warmth" feed (model-routing software-arch doc SS4.3) --
-          // not part of the generic onResult() shape above, since most
-          // routers have no use for it; an optional per-plugin extension,
-          // called only when a router implements it.
+          // Cache "warmth" feed -- not part of the generic onResult() shape
+          // above, since most routers have no use for it; an optional
+          // per-plugin extension, called only when a router implements it.
           if (conversation && requestedService) {
             router.recordObservedCache?.(
               conversation,
