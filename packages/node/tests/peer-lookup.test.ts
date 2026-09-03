@@ -430,4 +430,5 @@ describe('PeerLookup', () => {
     expect(results[0]?.port).toBe(6882);
     expect(results[0]?.metadata.publicAddress).toBe('34.27.100.162:6882');
   });
+
 });
