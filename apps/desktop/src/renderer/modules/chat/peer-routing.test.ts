@@ -1445,8 +1445,8 @@ test('explicit dropdown pick overrides the VPR auto-selected model for a new cha
   const sends: Array<{ conversationId: string; message: string; service?: string; provider?: string; peerId?: string }> = [];
   const api = initChatModule({ bridge: makeChatBridge(sends), uiState, appendSystemLog: () => undefined });
 
-  // The user explicitly picks model-b in the ChatView dropdown; the pick must
-  // win over the VPR default (previously it was silently overridden).
+  // The user explicitly picks model-b in the ChatView dropdown; the pick
+  // must win over the VPR default.
   api.handleServiceChange(`openai${SEP}model-b${SEP}peer-b`);
   api.sendMessage('explicit pick wins');
   await waitFor(() => sends.length === 1);

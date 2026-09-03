@@ -22,7 +22,7 @@ const fallbackPreferences: VprRoutingPreferences = {
   allowedPeerIds: [],
   blockedPeerIds: [],
   cqt: 5,
-  autoDayPassEnabled: false,
+  dayPassOnDemandEnabled: false,
 };
 
 test('migrates the previous zero default to the new 6.0 minimum', () => {
@@ -81,8 +81,9 @@ test('valid VPR preferences and route selection save and load', () => {
     allowedPeerIds: ['peer-1'],
     blockedPeerIds: ['peer-2', 'peer-3'],
     cqt: 7,
-    autoDayPassEnabled: true,
+    dayPassOnDemandEnabled: true,
     selectedRouterPackage: '@antseed/router-custom',
+    agreedDayPassPricesUsdc: { cccccccccccccccccccccccccccccccccccccccc: 0.89 },
   };
   const routeSelection: VprRouteSelection = {
     model: {
@@ -102,6 +103,33 @@ test('valid VPR preferences and route selection save and load', () => {
   assert.deepEqual(loadVprRouteSelection(fallbackRouteSelection), routeSelection);
 });
 
+test('agreedDayPassPricesUsdc drops malformed entries instead of the whole map', () => {
+  localStorage.setItem(VPR_PREFERENCES_STORAGE_KEY, JSON.stringify({
+    ...fallbackPreferences,
+    agreedDayPassPricesUsdc: {
+      cccccccccccccccccccccccccccccccccccccccc: 0.89,
+      dddddddddddddddddddddddddddddddddddddddd: 'not-a-number',
+      eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee: -1,
+    },
+  }));
+
+  assert.deepEqual(
+    loadVprRoutingPreferences(fallbackPreferences).agreedDayPassPricesUsdc,
+    { cccccccccccccccccccccccccccccccccccccccc: 0.89 },
+  );
+});
+
+test('agreedDayPassPricesUsdc falls back to the fallback map when nothing is stored', () => {
+  const fallbackWithAgreedPrice: VprRoutingPreferences = {
+    ...fallbackPreferences,
+    agreedDayPassPricesUsdc: { cccccccccccccccccccccccccccccccccccccccc: 1.2 },
+  };
+  assert.deepEqual(
+    loadVprRoutingPreferences(fallbackWithAgreedPrice).agreedDayPassPricesUsdc,
+    { cccccccccccccccccccccccccccccccccccccccc: 1.2 },
+  );
+});
+
 test('buyer config projection includes every field an installed router plugin\'s payment gate reads', () => {
   assert.deepEqual(buyerModelRoutingPreferences(fallbackPreferences), {
     preferFreePeers: fallbackPreferences.preferFreePeers,
@@ -110,16 +138,17 @@ test('buyer config projection includes every field an installed router plugin\'s
     allowedPeerIds: fallbackPreferences.allowedPeerIds,
     blockedPeerIds: fallbackPreferences.blockedPeerIds,
     cqt: fallbackPreferences.cqt,
-    autoDayPassEnabled: fallbackPreferences.autoDayPassEnabled,
+    dayPassOnDemandEnabled: fallbackPreferences.dayPassOnDemandEnabled,
     selectedRouterPackage: null,
     autoRouting: fallbackPreferences.autoRouting,
+    agreedDayPassPricesUsdc: {},
   });
 });
 
 test('buyer config projection forwards autoRouting -- an installed router\'s real-money signing can gate on this too', () => {
   // Regression: a buyer trying to stop day-pass billing reasonably
   // reached for the "Auto select seller" switch instead of the separate
-  // control that owns autoDayPassEnabled, and billing kept running
+  // control that owns dayPassOnDemandEnabled, and billing kept running
   // because this field used to be dropped from the projection entirely.
   const projected = buyerModelRoutingPreferences({ ...fallbackPreferences, autoRouting: false });
   assert.equal(projected.autoRouting, false);
@@ -128,35 +157,35 @@ test('buyer config projection forwards autoRouting -- an installed router\'s rea
 test('buyer config projection forwards which router plugin is selected -- process-manager.ts reads this back to decide which router to start', () => {
   const projected = buyerModelRoutingPreferences({
     ...fallbackPreferences,
-    autoDayPassEnabled: true,
+    dayPassOnDemandEnabled: true,
     selectedRouterPackage: '@antseed/router-custom',
   });
   assert.equal(projected.selectedRouterPackage, '@antseed/router-custom');
 });
 
-test('selectedRouterPackage stays unselected when absent from stored preferences, regardless of autoDayPassEnabled', () => {
-  for (const autoDayPassEnabled of [true, false]) {
+test('selectedRouterPackage stays unselected when absent from stored preferences, regardless of dayPassOnDemandEnabled', () => {
+  for (const dayPassOnDemandEnabled of [true, false]) {
     localStorage.setItem(
       VPR_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({ ...fallbackPreferences, autoDayPassEnabled }),
+      JSON.stringify({ ...fallbackPreferences, dayPassOnDemandEnabled }),
     );
     assert.equal(loadVprRoutingPreferences(fallbackPreferences).selectedRouterPackage, null);
   }
 });
 
-test('an explicit "None" (selectedRouterPackage: null) stays unselected regardless of autoDayPassEnabled', () => {
-  for (const autoDayPassEnabled of [true, false]) {
+test('an explicit "None" (selectedRouterPackage: null) stays unselected regardless of dayPassOnDemandEnabled', () => {
+  for (const dayPassOnDemandEnabled of [true, false]) {
     localStorage.setItem(
       VPR_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({ ...fallbackPreferences, autoDayPassEnabled, selectedRouterPackage: null }),
+      JSON.stringify({ ...fallbackPreferences, dayPassOnDemandEnabled, selectedRouterPackage: null }),
     );
     assert.equal(loadVprRoutingPreferences(fallbackPreferences).selectedRouterPackage, null);
   }
 });
 
 test('buyer config projection forwards the day-pass-enable toggle -- real money gate, must not drop silently', () => {
-  const projected = buyerModelRoutingPreferences({ ...fallbackPreferences, autoDayPassEnabled: true });
-  assert.equal(projected.autoDayPassEnabled, true);
+  const projected = buyerModelRoutingPreferences({ ...fallbackPreferences, dayPassOnDemandEnabled: true });
+  assert.equal(projected.dayPassOnDemandEnabled, true);
 });
 
 test('cqt dial value round-trips through save/load', () => {

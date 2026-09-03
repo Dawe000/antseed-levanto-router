@@ -1356,20 +1356,21 @@ export function initChatModule({
     // pinned to the conversation's original peer, so the outbound request
     // ends up with pin-peer=<originalPeer> + service=<unrelated peer's
     // service>, which the buyer proxy rejects with "Service strict-miss" in
-    // a permanent 502 loop. This is the exact flip that turned a kimi-k2.6
-    // chat into a chaotic-pm chat when the original peer's metadata briefly
-    // dropped its service on re-hydration.
+    // a permanent 502 loop -- silently flipping an active conversation's
+    // model mid-session if the original peer's metadata briefly drops its
+    // service on re-hydration.
     const firstOptionFallback = hasActiveConversation ? null : (optionCandidates[0]?.value ?? null);
     // The Auto sentinel is exempt from the whole lookup/fallback chain below:
     // no real seller ever advertises the active router's auto-sentinel
-    // serviceId, so `optionCandidates` (built purely from real discovered rows) can never contain it, and
-    // `findMatchingChatServiceOptionValue` always misses. Before this guard,
-    // that permanent miss fell through to `firstOptionFallback` — most
-    // dangerously during the timing window before a brand-new conversation
-    // is registered as active (`hasActiveConversation` false), silently and
-    // permanently rebinding a fresh Auto chat to whatever real model sorted
-    // first (e.g. "glm-5.2"), exactly the applyPeerAccessRules stranding bug
-    // fixed earlier, in this sibling function which lacked the same fix.
+    // serviceId, so `optionCandidates` (built purely from real discovered
+    // rows) can never contain it, and `findMatchingChatServiceOptionValue`
+    // always misses. Without this exemption, that permanent miss would fall
+    // through to `firstOptionFallback` — most dangerously during the timing
+    // window before a brand-new conversation is registered as active
+    // (`hasActiveConversation` false), silently and permanently rebinding a
+    // fresh Auto chat to whatever real model sorted first (e.g. "glm-5.2"),
+    // the same stranding risk `applyPeerAccessRules` guards against
+    // elsewhere.
     // Broader than checking `currentSelection` alone: `chatSelectedServiceValue`
     // can drift to a real model id even while the conversation (or, with none
     // active, the global preference) is still genuinely on Auto -- e.g.
@@ -1512,7 +1513,7 @@ export function initChatModule({
   function adoptDefaultVprModel(): VprSelectedModel | null {
     const defaultModel = selectDefaultVprModel(
       uiState.vprModelCatalog, null, freeEntryRouteReputation,
-      uiState.vprRoutingPreferences.autoDayPassEnabled ?? false,
+      uiState.vprRoutingPreferences.dayPassOnDemandEnabled ?? false,
     );
     if (!defaultModel) return null;
     const entry = findCatalogEntry(uiState.vprModelCatalog, defaultModel.provider, defaultModel.serviceId);
@@ -1618,10 +1619,10 @@ export function initChatModule({
     }
   }
 
-  // Service-discovery failures (notably the 12s IPC timeout above) used to be
-  // invisible in exported logs — the runtime looked healthy while the model
-  // list stayed empty. Log the first failure, then one summary per minute,
-  // plus the recovery, so a log export tells the story.
+  // Service-discovery failures (notably the 12s IPC timeout above) would
+  // otherwise be invisible in exported logs — the runtime would look healthy
+  // while the model list stayed empty. Log the first failure, then one
+  // summary per minute, plus the recovery, so a log export tells the story.
   let discoverFailureStreak = 0;
   let discoverFailureLogAt = 0;
   function noteDiscoverFailure(message: string): void {

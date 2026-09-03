@@ -13,6 +13,7 @@ import {
   decodeSweepRequest,
   faultAttributionOf,
   faultCodeOf,
+  getOpenRouterReferencePrices,
   isModelRouteEligible,
   modelRouteTotalPrice,
   peerSupportsCooperativeClose,
@@ -106,6 +107,7 @@ import { PeerAttributionTracker, HEARTBEAT_MS } from './peer-attribution.js'
 import { estimateAnthropicPromptTokens, isCountTokensPath } from './count-tokens.js'
 import { getCachedVerdict, runVerifier, verifierSupportFingerprint, type CachedVerdict, type VerifierPolicy, type SellerReach, type VerifyOutcome } from '../plugins/verifier.js'
 import { loadConfig } from '../config/loader.js'
+import { BAKED_COMPARABLE_PRICES_URL } from '../generated/baked-defaults.js'
 
 // Re-export for backward compatibility (used by tests and other consumers)
 export { selectCandidatePeersForRouting, type CandidatePeerRouteSelection } from './routing.js'
@@ -114,8 +116,7 @@ export { parsePeerPinnedService, rewritePeerPinnedServiceInBody, substituteRoute
 /**
  * Why this daemon runs no hot-wallet deposit watcher — surfaced on
  * `/_antseed/deposits/status` so UIs can name the actual cause instead of
- * guessing (a missing watcher used to be indistinguishable from "this chain
- * has no deposit relay").
+ * guessing.
  */
 export type DepositWatcherAbsenceReason = 'external-daemon' | 'payments-disabled' | 'no-deposit-relay'
 
@@ -290,10 +291,12 @@ const MODEL_NOT_FOUND_REFRESH_THROTTLE_MS = 30_000
 const VERIFY_CACHE_MAX_ENTRIES = 1024
 
 /**
- * Statuses that prove the peer is alive and serving. Any response short of a
- * server error counts: a peer that answers 400 or 404 is reachable, and
+ * Statuses that prove the peer is alive and serving. Any 4xx below 500
+ * except 408 counts: a peer that answers 400 or 404 is reachable, and
  * treating only 2xx as proof would leave a stale cooldown on a healthy peer
- * that happens to reject every request.
+ * that happens to reject every request. 408 is excluded -- it signals the
+ * seller struggling/timing out (see failureReasonForStatus's 'seller-timeout'
+ * below), not a clean, healthy reject.
  */
 function isProofOfLife(statusCode: number): boolean {
   return statusCode < 500 && statusCode !== 408
@@ -1145,7 +1148,7 @@ export class BuyerProxy {
       log(
         `Routing preferences reloaded: minTrust=${next.minTrustScore} maxInput=${next.maxInputUsdPerMillion} `
         + `preferFree=${next.preferFreePeers} allow=${next.allowedPeerIds.length} block=${next.blockedPeerIds.length} `
-        + `autoDayPassEnabled=${next.autoDayPassEnabled ?? false}`,
+        + `dayPassOnDemandEnabled=${next.dayPassOnDemandEnabled ?? false}`,
       )
       // Toggling the day pass on/off, by itself, causes zero network or
       // signing activity -- the only trigger is a real routing dispatch
@@ -1517,27 +1520,9 @@ export class BuyerProxy {
 
   private async _discoverPeersFromNetwork(): Promise<PeerInfo[]> {
     log('Discovering peers via DHT...')
-    const [dhtPeers, directPeers] = await Promise.all([
-      this._node.discoverPeers(),
-      // Local-dev NAT-hairpinning escape hatch (directPeerAddresses, see
-      // AntseedNode.resolveDirectPeers' own doc comment): a no-op returning
-      // [] for any buyer that hasn't configured it. Merged here so the
-      // general catalog (Discover, model-picker, routing) includes peers a
-      // DHT crawl genuinely cannot find on this machine, not just the one
-      // connection findPeer resolves on demand.
-      this._node.resolveDirectPeers().catch((err) => {
-        log(`resolveDirectPeers failed, continuing with DHT results only: ${err instanceof Error ? err.message : String(err)}`)
-        return [] as PeerInfo[]
-      }),
-    ])
-    const byId = new Map<string, PeerInfo>()
-    for (const peer of dhtPeers) byId.set(peer.peerId.toLowerCase(), peer)
-    // Direct-address peers are the "known good" source for this one peer —
-    // prefer them over whatever the DHT crawl found for the same id.
-    for (const peer of directPeers) byId.set(peer.peerId.toLowerCase(), peer)
-    const peers = Array.from(byId.values())
+    const peers = await this._node.discoverPeers()
     if (peers.length > 0) {
-      log(`Found ${peers.length} peer(s)${directPeers.length > 0 ? ` (${directPeers.length} via direct address)` : ''}`)
+      log(`Found ${peers.length} peer(s)`)
     }
     return peers
   }
@@ -1954,11 +1939,10 @@ export class BuyerProxy {
     }
 
     if (path === '/_antseed/routing-decisions' && method === 'GET') {
-      // routing_decisions local ledger (model-routing software-architecture
-      // doc SS2.5) -- generic read of whatever the registered router's own
-      // getRoutingDecisions() reports, for VPR's savings dashboard (decisions
-      // doc SS4.5). Empty for a router that doesn't implement selectRoute
-      // (e.g. the default router-local), not an error.
+      // routing_decisions local ledger -- generic read of whatever the
+      // registered router's own getRoutingDecisions() reports, for VPR's
+      // savings dashboard. Empty for a router that doesn't implement
+      // selectRoute (e.g. the default router-local), not an error.
       const router = this._node.router
       const rows = router?.getRoutingDecisions?.() ?? []
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -2040,6 +2024,34 @@ export class BuyerProxy {
       const notice = this._getDayPassPriceIncreaseNotice?.() ?? null
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: true, notice }))
+      return
+    }
+
+    if (path.startsWith('/_antseed/openrouter-reference-prices') && method === 'GET') {
+      // Retail-price comparison for the savings dashboard's "vs OpenRouter"
+      // figure -- kept separate from routing_decisions' own baselinePrices
+      // (AntSeed's own network price),
+      // since conflating the two would credit the router for savings that
+      // actually come from AntSeed's marketplace undercutting OpenRouter
+      // retail. Resolved server-side (not exposing the raw canonical map)
+      // so the dashboard's client-side JS never needs to replicate
+      // canonicalModelKey's normalization rules itself.
+      const url = new URL(path, 'http://localhost')
+      const requested = (url.searchParams.get('models') ?? '').split(',').map((m) => m.trim()).filter(Boolean)
+      // Same baked-default file `antseed buyer activity`'s Saved tile already
+      // reads (apps/cli/src/cli/commands/buyer/activity.ts) -- null for a
+      // from-source build, a real URL once scripts/bake-comparable-prices-url.mjs
+      // has run for a release. ANTSEED_COMPARABLE_PRICES_URL always overrides it.
+      const referenceMap = await getOpenRouterReferencePrices(BAKED_COMPARABLE_PRICES_URL)
+      const prices: Record<string, { inUsdPerM: number | null; outUsdPerM: number | null; cachedInUsdPerM: number | null } | null> = {}
+      for (const model of requested) {
+        const ref = referenceMap[canonicalModelKey(model)]
+        prices[model] = ref
+          ? { inUsdPerM: ref.input, outUsdPerM: ref.output, cachedInUsdPerM: ref.cachedInput }
+          : null
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, prices }))
       return
     }
 
@@ -3311,36 +3323,10 @@ export class BuyerProxy {
         responseForClient = adaptPeerResponse(responseForClient)
         if (
           !streamed
+          && adaptResponse
           && responseForClient.headers[ANTSEED_FAULT_ATTRIBUTION_HEADER]?.toLowerCase() !== 'buyer'
         ) {
-          // A fast/local peer can deliver a small streaming response as one
-          // buffered blob instead of incremental chunks, so `streamed` above
-          // stays false even though the body is still SSE-formatted (the
-          // seller replies to `stream:true` with `data: ...` frames
-          // regardless of transport chunking). transformResponse() expects a
-          // single JSON object and silently no-ops on an SSE body, which let
-          // untranslated seller-protocol chunks reach clients expecting a
-          // different protocol (e.g. Anthropic Messages clients received raw
-          // OpenAI chat-completion chunks and saw an empty stream). Detect
-          // that case by content-type and run it through the same streaming
-          // adapter as a single terminal chunk instead.
-          const isSseBody = (responseForClient.headers['content-type'] ?? '')
-            .toLowerCase()
-            .includes('text/event-stream')
-          if (streamResponseAdapter && isSseBody) {
-            const startResponse = streamResponseAdapter.adaptStart(responseForClient)
-            const adaptedChunks = streamResponseAdapter.adaptChunk({
-              requestId: responseForClient.requestId,
-              data: responseForClient.body,
-              done: true,
-            })
-            responseForClient = {
-              ...startResponse,
-              body: Buffer.concat(adaptedChunks.map((adaptedChunk) => Buffer.from(adaptedChunk.data))),
-            }
-          } else if (adaptResponse) {
-            responseForClient = adaptResponse(responseForClient)
-          }
+          responseForClient = adaptResponse(responseForClient)
         }
         responseForClient = adaptOpenAICompatibleErrorResponse(responseForClient, requestProtocol)
         responseForClient = this._withFriendlyUploadLimitError(responseForClient, requestForPeer.body.length, requestedService)
@@ -3570,7 +3556,15 @@ export class BuyerProxy {
         fault === 'buyer' ? 'buyer-local' : 'request-failed',
         fault,
       )
-      if (router && fault !== 'buyer' && routeAlternatives) {
+      // No routeAlternatives gate here -- a transport-level failure (timeout,
+      // ECONNREFUSED) must reach the router the same way an HTTP-level
+      // failure already does via the success-path onResult calls above,
+      // regardless of whether this dispatch went through selectRoute() or a
+      // plain pinned peer. Gating this on routeAlternatives would silently
+      // hide transport failures from a router plugin for any non-selectRoute
+      // dispatch, while it still sees the same failure when it arrives as a
+      // non-2xx HTTP response instead of a thrown error.
+      if (router && fault !== 'buyer') {
         router.onResult(selectedPeer, {
           success: false,
           latencyMs,

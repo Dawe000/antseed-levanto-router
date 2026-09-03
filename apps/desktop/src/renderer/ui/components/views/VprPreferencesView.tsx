@@ -83,13 +83,13 @@ export function VprPreferencesView({ onSelectView }: Props) {
   const { data: priceIncreaseNotice } = useCachedResource(dayPassPriceIncreaseResource);
   useEffect(() => {
     if (!priceIncreaseNotice || pendingRouterPlugin) return;
-    if (!snap.preferences.autoDayPassEnabled || !snap.preferences.selectedRouterPackage) return;
+    if (!snap.preferences.dayPassOnDemandEnabled || !snap.preferences.selectedRouterPackage) return;
     const activePlugin = availableRouters.find((r) => r.package === snap.preferences.selectedRouterPackage);
     if (activePlugin) setPendingRouterPlugin(activePlugin);
   }, [
     priceIncreaseNotice,
     pendingRouterPlugin,
-    snap.preferences.autoDayPassEnabled,
+    snap.preferences.dayPassOnDemandEnabled,
     snap.preferences.selectedRouterPackage,
     availableRouters,
   ]);
@@ -103,14 +103,14 @@ export function VprPreferencesView({ onSelectView }: Props) {
   // Real gate on the daily day pass and the CQT dial -- a standing,
   // explicit toggle, not a proxy for whatever model happens to be selected
   // at this moment.
-  const autoDayPassEnabled = snap.preferences.autoDayPassEnabled ?? false;
+  const dayPassOnDemandEnabled = snap.preferences.dayPassOnDemandEnabled ?? false;
 
   const selectTheme = (mode: ThemeMode) => {
     applyThemeMode(mode);
     setThemeMode(mode);
   };
 
-  const selectedRouterPackage = autoDayPassEnabled ? (snap.preferences.selectedRouterPackage ?? null) : null;
+  const selectedRouterPackage = dayPassOnDemandEnabled ? (snap.preferences.selectedRouterPackage ?? null) : null;
   const routerDescription = useMemo(() => {
     if (!selectedRouterPackage) return GENERIC_ROUTER_DESCRIPTION;
     const plugin = availableRouters.find((router) => router.package === selectedRouterPackage);
@@ -146,15 +146,15 @@ export function VprPreferencesView({ onSelectView }: Props) {
           <div className={styles.routerGroup}>
             <div className={styles.routerHead}>
               <span className={styles.routerTitle}>Select model router</span>
-              {autoDayPassEnabled ? <VprBadge tone="green">Router enabled</VprBadge> : null}
+              {dayPassOnDemandEnabled ? <VprBadge tone="green">Router enabled</VprBadge> : null}
             </div>
             <select
               className={styles.routerSelect}
-              value={autoDayPassEnabled ? (snap.preferences.selectedRouterPackage ?? 'none') : 'none'}
+              value={dayPassOnDemandEnabled ? (snap.preferences.selectedRouterPackage ?? 'none') : 'none'}
               onChange={(event) => {
                 const nextPackage = event.target.value;
                 if (nextPackage === 'none') {
-                  actions.updateVprRoutingPreferences({ autoDayPassEnabled: false, selectedRouterPackage: null });
+                  actions.updateVprRoutingPreferences({ dayPassOnDemandEnabled: false, selectedRouterPackage: null });
                   return;
                 }
                 const plugin = availableRouters.find((router) => router.package === nextPackage);
@@ -162,7 +162,7 @@ export function VprPreferencesView({ onSelectView }: Props) {
                 // Enabling costs real, recurring money -- explain and
                 // confirm before it takes effect. The <select> itself
                 // reverts to "None" on the next render if the user
-                // cancels, since autoDayPassEnabled never changed.
+                // cancels, since dayPassOnDemandEnabled never changed.
                 setPendingRouterPlugin(plugin);
               }}
               aria-label="Select model router"
@@ -175,7 +175,7 @@ export function VprPreferencesView({ onSelectView }: Props) {
             <div className={styles.routerDescription}>{routerDescription}</div>
           </div>
 
-          {autoDayPassEnabled ? (
+          {dayPassOnDemandEnabled ? (
             <div className={styles.sliderGroup}>
               <div className={styles.sliderHead}>
                 <span className={styles.sliderTitle}>Cost / quality tradeoff</span>
@@ -215,7 +215,7 @@ export function VprPreferencesView({ onSelectView }: Props) {
               </span>
             </div>
             <VprSlider
-              min={autoDayPassEnabled ? AUTO_DAY_PASS_MIN_TRUST_SCORE : 0}
+              min={dayPassOnDemandEnabled ? AUTO_DAY_PASS_MIN_TRUST_SCORE : 0}
               max={100}
               step={5}
               value={snap.preferences.minTrustScore}
@@ -224,7 +224,7 @@ export function VprPreferencesView({ onSelectView }: Props) {
             />
             <div className={styles.sliderHint}>
               Providers rated below this are never used
-              {autoDayPassEnabled ? ' — locked to 7.0+ while a model router is selected' : ''}
+              {dayPassOnDemandEnabled ? ' — locked to 7.0+ while a model router is selected' : ''}
             </div>
           </div>
 
@@ -404,13 +404,27 @@ export function VprPreferencesView({ onSelectView }: Props) {
         isOpen={pendingRouterPlugin !== null}
         plugin={pendingRouterPlugin}
         onClose={() => setPendingRouterPlugin(null)}
-        onConfirm={() => {
+        onConfirm={(offer) => {
           if (!pendingRouterPlugin) return;
           actions.updateVprRoutingPreferences({
-            autoDayPassEnabled: true,
+            dayPassOnDemandEnabled: true,
             selectedRouterPackage: pendingRouterPlugin.package,
             ...(snap.preferences.minTrustScore < AUTO_DAY_PASS_MIN_TRUST_SCORE
               ? { minTrustScore: AUTO_DAY_PASS_MIN_TRUST_SCORE }
+              : {}),
+            // Records this as the buyer's agreed price for this seller --
+            // day-pass signing must never exceed it until explicitly
+            // re-confirmed here again. No peerId/price means the routing
+            // peer isn't currently advertising one; nothing to record yet,
+            // day-pass-signing.ts's own first-signature bootstrap will
+            // record whatever the live price turns out to be instead.
+            ...(offer?.peerId && typeof offer.flatUsdPrice === 'number'
+              ? {
+                agreedDayPassPricesUsdc: {
+                  ...snap.preferences.agreedDayPassPricesUsdc,
+                  [offer.peerId]: offer.flatUsdPrice,
+                },
+              }
               : {}),
           });
           setPendingRouterPlugin(null);

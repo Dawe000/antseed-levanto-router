@@ -26,10 +26,11 @@ import {
   selectFavoriteVprCatalog,
   selectRecommendedVprCatalog,
 } from '../../../modules/catalog/recommended';
-import { isAutoRouterEntry } from '../../../modules/routing/auto-router';
+import { isAutoRouterEntry, AUTO_ROUTER_LABEL } from '../../../modules/routing/auto-router';
 import { selectDefaultVprModel } from '../../../modules/catalog/model-catalog';
 import { connectVprProfile } from '../../../modules/routing/proxy-sync';
-import { buyerConversationsResource, systemProxyResource } from '../../../modules/app/vpr-resources';
+import { computeRouterSavings } from '../../../modules/routing/router-savings';
+import { buyerConversationsResource, routingDecisionsResource, systemProxyResource } from '../../../modules/app/vpr-resources';
 import { useCachedResource } from '../../../modules/app/cached-resource';
 import { shallowEqual, useUiSelector } from '../../hooks/useUiSelector';
 import { useActions } from '../../hooks/useActions';
@@ -89,7 +90,7 @@ export function VprHomeView({ onSelectView }: Props) {
     // Unfiltered discover list, for routed-peer name resolution.
     allRows: state.discoverRows,
     showRoutedPeer: state.vprFloatShowRoutedPeer,
-    autoDayPassEnabled: state.vprRoutingPreferences.autoDayPassEnabled ?? false,
+    dayPassOnDemandEnabled: state.vprRoutingPreferences.dayPassOnDemandEnabled ?? false,
   }), shallowEqual);
   const proxyResource = useCachedResource(systemProxyResource);
   const conversationsResource = useCachedResource(buyerConversationsResource);
@@ -118,11 +119,11 @@ export function VprHomeView({ onSelectView }: Props) {
 
   const runtimeOn = snap.processes.some((process) => process.mode === 'connect' && process.running === true);
 
-  // The Auto router is now selectable from this "model for new chats" card
-  // too, the same as the chat model picker -- both surfaces share the same
+  // The Auto router is selectable from this "model for new chats" card too,
+  // the same as the chat model picker -- both surfaces share the same
   // underlying vprRouteSelection state (there is deliberately no separate
-  // copy of it for this page), so no extra plumbing is needed beyond no
-  // longer filtering the Auto sentinel out of this card's own catalog view.
+  // copy of it for this page), and this card's own catalog view includes
+  // the Auto sentinel alongside real models.
   const rawSelectedModel = snap.selection.model;
   const selectedModel = useMemo(() => {
     // No selection at all yet (e.g. before any chat has ever set the shared
@@ -130,17 +131,17 @@ export function VprHomeView({ onSelectView }: Props) {
     // controller.ts's own new-chat defaulting, so this card never shows
     // "nothing selected" while a real default is available.
     if (!rawSelectedModel) {
-      return snap.autoDayPassEnabled
+      return snap.dayPassOnDemandEnabled
         ? selectDefaultVprModel(snap.catalog, null, undefined, true)
         : selectDefaultVprModel(snap.catalog, null);
     }
     // A stale Auto selection left over from before the router was disabled --
     // fall back to a real model instead of showing a now-unusable sentinel.
-    if (isAutoRouterEntry(rawSelectedModel) && !snap.autoDayPassEnabled) {
+    if (isAutoRouterEntry(rawSelectedModel) && !snap.dayPassOnDemandEnabled) {
       return selectDefaultVprModel(snap.catalog, null);
     }
     return rawSelectedModel;
-  }, [rawSelectedModel, snap.catalog, snap.autoDayPassEnabled]);
+  }, [rawSelectedModel, snap.catalog, snap.dayPassOnDemandEnabled]);
   const selectedEntry = useMemo(
     () => (selectedModel
       ? findCatalogEntry(snap.catalog, selectedModel.provider, selectedModel.serviceId) ?? undefined
@@ -218,6 +219,17 @@ export function VprHomeView({ onSelectView }: Props) {
     return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
   }, [snap.catalog]);
   const expectedSavingsPct = measuredSavings?.pct ?? projectedSavingsPct;
+
+  // Router savings: a second, separate figure scoped to Auto-routed requests
+  // specifically -- shown alongside "AntSeed savings" above, never combined
+  // into it, since combining them would credit the router for savings that
+  // actually come from AntSeed's own marketplace. Absent entirely (not
+  // zero) for a buyer who has never used Auto routing.
+  const routingDecisions = useCachedResource(routingDecisionsResource, true).data;
+  const routerSavings = useMemo(
+    () => computeRouterSavings(routingDecisions ?? undefined),
+    [routingDecisions],
+  );
 
   // The usage tiles come from the payments summary; nudge a refresh when the
   // connected variant becomes visible (module-level throttle absorbs bursts).
@@ -601,6 +613,19 @@ export function VprHomeView({ onSelectView }: Props) {
             )
             : formatSavedUsd(0)}
         />
+        {routerSavings && (
+          <VprStatTile
+            label="Router savings"
+            value={(
+              <span
+                className={styles.savingValue}
+                title={`${AUTO_ROUTER_LABEL} vs retail: paid $${routerSavings.actualUsd.toFixed(2)} for routed usage worth $${routerSavings.baselineUsd.toFixed(2)} at retail reference prices`}
+              >
+                {formatSavedUsd(routerSavings.baselineUsd - routerSavings.actualUsd)}
+              </span>
+            )}
+          />
+        )}
       </VprStatRow>
     </div>
   );

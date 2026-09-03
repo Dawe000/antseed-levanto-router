@@ -24,10 +24,11 @@ export type ActiveAutoRouterPlugin = {
   provider: string;
   serviceId: string;
   label: string;
+  savingsBaselineModel?: string;
 };
 
 /**
- * Pure display fallback for when no router plugin is actually resolved --
+ * Pure display fallbacks for when no router plugin is actually resolved --
  * NOT a plugin identity, so nothing here is ever compared against a catalog
  * entry's `provider`/`serviceId` (see `isAutoRouterEntry`, which returns
  * `false` whenever `active` is `null`). A deployment with no router plugin
@@ -35,13 +36,14 @@ export type ActiveAutoRouterPlugin = {
  * actually route through anything.
  */
 const DEFAULT_AUTO_ROUTER_LABEL = 'Auto Router';
+const DEFAULT_SAVINGS_BASELINE_MODEL = 'claude-opus-5';
 
 let active: ActiveAutoRouterPlugin | null = null;
 
 export let AUTO_ROUTER_LABEL: string = DEFAULT_AUTO_ROUTER_LABEL;
 
 /**
- * Minimum trust score enforced while `autoDayPassEnabled` is on -- on the
+ * Minimum trust score enforced while `dayPassOnDemandEnabled` is on -- on the
  * *stored* 0-100 scale.
  * `reputationScaleLabel` (modules/catalog/seller-format.ts) displays this
  * scale as 0.0-10.0 (`score / 10`), so this constant is display "7.0". A
@@ -52,7 +54,7 @@ export const AUTO_DAY_PASS_MIN_TRUST_SCORE = 70;
 
 /**
  * Resolves the Auto entry's *identity* -- independent of whether
- * `autoDayPassEnabled` is currently on. `isAutoRouterEntry`/
+ * `dayPassOnDemandEnabled` is currently on. `isAutoRouterEntry`/
  * `isAutoRouterSelected` need to keep recognizing an already-selected Auto
  * conversation/model even after the user flips the toggle off (e.g. so a
  * discover refresh doesn't silently rebind it to a concrete model) -- only
@@ -72,6 +74,7 @@ function resolveActiveAutoRouterPlugin(
       provider: match.name,
       serviceId: match.autoRouteServiceId!,
       label: match.displayName,
+      savingsBaselineModel: match.savingsBaselineModel,
     };
   }
   // Router list not loaded yet, or the selected package isn't actually
@@ -92,13 +95,26 @@ export function isAutoRouterEntry(entry: Pick<VprModelCatalogEntry, 'provider' |
  * Null-safe wrapper around `isAutoRouterEntry` for `vprRouteSelection.model`
  * (which is `null` before any model is chosen). The CQT dial's visibility
  * gates on a dedicated Preferences toggle instead
- * (`VprRoutingPreferences.autoDayPassEnabled`) -- a momentary model
+ * (`VprRoutingPreferences.dayPassOnDemandEnabled`) -- a momentary model
  * selection is not a real substitute for explicit,
  * standing consent to a real-money day-pass charge. Kept for any other
  * "is Auto the current selection" check that isn't a consent gate.
  */
 export function isAutoRouterSelected(model: Pick<VprModelCatalogEntry, 'provider' | 'serviceId'> | null): boolean {
   return model !== null && isAutoRouterEntry(model);
+}
+
+/**
+ * The active plugin's declared savings-comparison baseline model, or a
+ * plugin-agnostic generic default when no plugin is active/declares one --
+ * the savings dashboard (router-savings.ts) always needs *some* default
+ * even while Auto is off, since it summarizes past `routing_decisions`
+ * history. Not tied to any specific plugin's identity -- just a reasonable
+ * flagship reference price, same reasoning as `recommended.ts`'s own
+ * flagship-tier slot.
+ */
+export function activeAutoRouterSavingsBaselineModel(): string {
+  return active?.savingsBaselineModel ?? DEFAULT_SAVINGS_BASELINE_MODEL;
 }
 
 /**
@@ -135,7 +151,7 @@ export function currentAutoRouteEntry(): VprModelCatalogEntry | null {
 
 /**
  * Idempotently prepends the Auto entry to a freshly-derived catalog, but only
- * when `preferences.autoDayPassEnabled` is true -- the entry starts a
+ * when `preferences.dayPassOnDemandEnabled` is true -- the entry starts a
  * real daily USDC charge, so it must not be offered as a pickable model until
  * the buyer has explicitly consented via the Preferences toggle (decisions
  * doc SS14 item 29). Also refreshes the shared "active router" cache that
@@ -151,13 +167,13 @@ export function currentAutoRouteEntry(): VprModelCatalogEntry | null {
  */
 export function withAutoRouterCatalogEntry(
   catalog: VprModelCatalogEntry[],
-  preferences: Pick<VprRoutingPreferences, 'autoDayPassEnabled' | 'selectedRouterPackage'>,
+  preferences: Pick<VprRoutingPreferences, 'dayPassOnDemandEnabled' | 'selectedRouterPackage'>,
   availableRouters: RouterPluginInfo[],
 ): VprModelCatalogEntry[] {
   active = resolveActiveAutoRouterPlugin(preferences, availableRouters);
   AUTO_ROUTER_LABEL = active?.label ?? DEFAULT_AUTO_ROUTER_LABEL;
 
-  if (!preferences.autoDayPassEnabled || !active) {
+  if (!preferences.dayPassOnDemandEnabled || !active) {
     return catalog.some(isAutoRouterEntry) ? catalog.filter((entry) => !isAutoRouterEntry(entry)) : catalog;
   }
   if (catalog.some(isAutoRouterEntry)) return catalog;

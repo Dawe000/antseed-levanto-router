@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { HugeiconsIcon } from '@hugeicons/react';
 import { ArrowRight01Icon, CreditCardIcon, Download01Icon, SquareLock01Icon, Upload01Icon, Wallet01Icon } from '@hugeicons/core-free-icons';
 import { shallowEqual, useUiSelector } from '../../hooks/useUiSelector';
@@ -7,8 +7,12 @@ import { formatCredits, shortAddress } from '../../../core/format';
 import { formatCompactTokens, VprCard, VprPage, VprStatRow, VprStatTile } from '../vpr/VprKit';
 import { BalanceSummaryCard } from './BalanceSummaryCard';
 import { ExportSignerKeyDialog, ImportSignerKeyDialog } from './SignerKeyDialogs';
-import styles from './VprCreditsView.module.scss';
 import { recordUserAction } from '../../../modules/telemetry/actions';
+import { useCachedResource } from '../../../modules/app/cached-resource';
+import { routingDecisionsResource, savingsBaselineModelResource } from '../../../modules/app/vpr-resources';
+import { computeRecentRouterSavings, SEVEN_DAYS_MS } from '../../../modules/routing/router-savings';
+import { formatSavedUsd } from '../../../modules/catalog/measured-savings';
+import styles from './VprCreditsView.module.scss';
 
 const PAYMENT_SUMMARY_POLL_MS = 60_000;
 
@@ -28,6 +32,7 @@ export function VprCreditsView({ onSelectView }: Props) {
     operatorAddress: state.creditsOperatorAddress,
     usage: state.creditsBuyerUsage,
     rewards: state.creditsRewards,
+    dayPassOnDemandEnabled: state.vprRoutingPreferences.dayPassOnDemandEnabled ?? false,
   }), shallowEqual);
   // Local to the button: background pollers (floating pill, payment events)
   // also refresh the summary, and mirroring their in-flight state here made
@@ -54,6 +59,15 @@ export function VprCreditsView({ onSelectView }: Props) {
     return () => window.clearInterval(timer);
   }, [actions]);
 
+
+  // Only polled while a router is actually selected -- the pill itself is
+  // hidden otherwise, so there's nothing for this data to feed.
+  const routingDecisions = useCachedResource(routingDecisionsResource, snap.dayPassOnDemandEnabled).data;
+  const savingsBaselineModel = useCachedResource(savingsBaselineModelResource, snap.dayPassOnDemandEnabled).data;
+  const last7DaysSavings = useMemo(
+    () => computeRecentRouterSavings(routingDecisions, SEVEN_DAYS_MS, Date.now(), savingsBaselineModel ?? undefined),
+    [routingDecisions, savingsBaselineModel],
+  );
 
   const balanceValues = {
     available: snap.available,
@@ -141,6 +155,26 @@ export function VprCreditsView({ onSelectView }: Props) {
             <HugeiconsIcon icon={ArrowRight01Icon} size={16} strokeWidth={2} />
           </button>
         </VprCard>
+
+        {snap.dayPassOnDemandEnabled && (
+          <VprCard className={styles.rewardsCard}>
+            <span className={styles.rewardsText}>
+              <strong>Auto-routing savings</strong>{' '}
+              {last7DaysSavings
+                ? `You've saved ${formatSavedUsd(last7DaysSavings.baselineUsd - last7DaysSavings.actualUsd)} in the past 7 days`
+                  + (savingsBaselineModel ? `, vs. ${savingsBaselineModel}.` : '.')
+                : 'No routed savings to show yet.'}
+            </span>
+            <button
+              type="button"
+              className={styles.rewardsLink}
+              onClick={() => { void window.antseedDesktop?.paymentsOpenSavingsPage?.(); }}
+            >
+              <span>Open details</span>
+              <HugeiconsIcon icon={ArrowRight01Icon} size={16} strokeWidth={2} />
+            </button>
+          </VprCard>
+        )}
 
         <VprCard className={styles.detailsCard}>
           <div className={styles.detailRow}>

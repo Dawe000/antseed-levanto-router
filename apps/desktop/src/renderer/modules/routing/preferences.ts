@@ -46,6 +46,16 @@ function readNonNegativeFiniteNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
+/** Seller peer id -> agreed day-pass price (whole USD), dropping any malformed entries rather than the whole map. */
+function readAgreedDayPassPrices(value: unknown, fallback: Record<string, number>): Record<string, number> {
+  if (!isStoredObject(value)) return fallback;
+  const out: Record<string, number> = {};
+  for (const [peerId, price] of Object.entries(value)) {
+    if (typeof price === 'number' && Number.isFinite(price) && price >= 0) out[peerId] = price;
+  }
+  return out;
+}
+
 /** CQT dial: only these five discrete positions are valid. */
 const VALID_CQT_VALUES = new Set([1, 3, 5, 7, 9]);
 
@@ -105,7 +115,7 @@ export function loadVprRoutingPreferences(fallback: VprRoutingPreferences): VprR
   // value, never on -- readBoolean's `fallback` here must itself be `false`
   // (see DEFAULT_MODEL_ROUTING_PREFERENCES), not inherited from some other
   // truthy default.
-  const autoDayPassEnabled = readBoolean(parsed.autoDayPassEnabled, fallback.autoDayPassEnabled ?? false);
+  const dayPassOnDemandEnabled = readBoolean(parsed.dayPassOnDemandEnabled, fallback.dayPassOnDemandEnabled ?? false);
 
   return {
     autoRouting: readBoolean(parsed.autoRouting, fallback.autoRouting),
@@ -122,13 +132,17 @@ export function loadVprRoutingPreferences(fallback: VprRoutingPreferences): VprR
       ? normalizePeerIdList(parsed.blockedPeerIds)
       : fallback.blockedPeerIds,
     cqt: readCqt(parsed.cqt, fallback.cqt ?? 5),
-    autoDayPassEnabled,
+    dayPassOnDemandEnabled,
     // Nothing is selected until the user explicitly picks a router, whether
     // the field is absent or explicitly `null` (VprPreferencesView writes
     // `null` for the user's "None" choice) -- both resolve the same way.
     selectedRouterPackage: readNullableString(
       parsed.selectedRouterPackage,
       fallback.selectedRouterPackage ?? null,
+    ),
+    agreedDayPassPricesUsdc: readAgreedDayPassPrices(
+      parsed.agreedDayPassPricesUsdc,
+      fallback.agreedDayPassPricesUsdc ?? {},
     ),
   };
 }
@@ -155,9 +169,10 @@ export function buyerModelRoutingPreferences(
     allowedPeerIds: validPeerIds(value.allowedPeerIds),
     blockedPeerIds: validPeerIds(value.blockedPeerIds),
     cqt: value.cqt,
-    autoDayPassEnabled: value.autoDayPassEnabled,
+    dayPassOnDemandEnabled: value.dayPassOnDemandEnabled,
     selectedRouterPackage: value.selectedRouterPackage ?? null,
     autoRouting: value.autoRouting,
+    agreedDayPassPricesUsdc: value.agreedDayPassPricesUsdc ?? {},
   };
 }
 

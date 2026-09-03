@@ -205,6 +205,7 @@ export type RouterPluginMetadata = {
   autoRouteServiceId?: string;
   autoRouteInfo?: { title: string; body: string };
   preferencesSummary?: string;
+  savingsBaselineModel?: string;
   configSchema?: ConfigField[];
 };
 
@@ -244,6 +245,7 @@ export async function listInstalledRouterPluginMetadata(): Promise<RouterPluginM
         autoRouteServiceId: plugin.autoRouteServiceId,
         autoRouteInfo: plugin.autoRouteInfo,
         preferencesSummary: plugin.preferencesSummary,
+        savingsBaselineModel: plugin.savingsBaselineModel,
         configSchema: plugin.configSchema,
       });
     } catch (err) {
